@@ -27,3 +27,23 @@ julia --project=RemoteFHE examples/client.jl
 
 This project uses Julia's `Sockets` and `Serialization` libraries for transport.
 The server does not decrypt client data; it operates on encrypted ciphertext and returns an encrypted result.
+
+# Ideas for the Future
+
+## gRPC
+
+For a standardized and established way of managing Remote Procedure calls, we could use gRPC. There currently is no official implementation for julia, see the [gRPC repository list](https://github.com/orgs/grpc/repositories).
+
+There are
+- [gRPCClient.jl](https://github.com/JuliaIO/gRPCClient.jl), since 2021, 65 GitHub stars
+- [gRPCServer.jl](https://github.com/s-celles/gRPCServer.jl), since 2026, 5 GitHub stars
+
+
+The client side is much more mature thatn the server. Implement the server in C++ and the client in julia?
+
+## Distributed.jl
+
+NOTE: This idea if off the table since the nodes dont necessarily trust the clients to execute arbitrary code.
+
+With the current approach, the algorithms that the server can run must be predefined. We could use [Distributed.jl](https://github.com/JuliaLang/Distributed.jl) to execute arbitrary code on the remote server.
+This would give us
