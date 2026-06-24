@@ -1,7 +1,7 @@
 module RemoteFHE
 
 using Serialization
-using Sockets
+using HTTP
 using OpenFHE
 using SecureArithmetic
 
@@ -31,63 +31,93 @@ function encrypt_vector(values::AbstractVector{<:Real}, public_key, context)
     encrypt(plaintext, public_key)
 end
 
-# sockets are an IO
-# using Serialization.serialize, we can serialize directly into sockets
-# See e.g. https://github.com/JuliaWeb/RemoteREPL.jl/blob/7b0f6072eb9477f12579493db518a48ec6c55f1e/src/client.jl#L145
-function send_to_server(sock::IO, context, public_key, ciphertext)
-    serialize(sock, context)
-    serialize(sock, public_key)
-    serialize(sock, ciphertext)
-    flush(sock)
+"""
+    make_part(obj) -> HTTP.Multipart
+
+Serialize `obj` into an `HTTP.Multipart` part using Julia's `Serialization` stdlib.
+
+The content type `application/x-julia-serialized-object` follows the convention
+established by Java's `application/x-java-serialized-object` for language-specific
+serialized objects.
+"""
+function make_part(obj)
+    io = IOBuffer()
+    serialize(io, obj)
+    seekstart(io)
+    HTTP.Multipart(nothing, io, "application/x-julia-serialized-object")
 end
 
-function receive_from_client(sock::IO)
-    context = deserialize(sock)
-    public_key = deserialize(sock)
-    ciphertext = deserialize(sock)
-    (; context, public_key, ciphertext)
+"""
+    parse_parts(parts::Vector{HTTP.Multipart}) -> Dict{String, Any}
+
+Deserialize a vector of multipart form parts into a name-value dictionary.
+Parts with content type `application/x-julia-serialized-object` are deserialized
+via `Serialization.deserialize`.
+"""
+function parse_parts(parts::Vector{HTTP.Multipart})
+    Dict(
+        p.name => if p.contenttype == "application/x-julia-serialized-object"
+            deserialize(p.data)
+        else
+            read(p.data)  # return raw data for unknown types
+        end
+        for p in parts
+    )
 end
 
 
-function run_server(port::Integer = 25015)
-    server = Sockets.listen(port)
-    println("RemoteFHE server listening on port $port")
+function run_server(port::Integer = 8080)
+    router = HTTP.Router()
 
-    sock = accept(server)
-    try
-        println("Client connected")
+    HTTP.register!(router, "POST", "/compute") do req
+        try
+            parts = HTTP.parse_multipart_form(req)
+            parts === nothing && return HTTP.Response(415, "expected multipart/form-data")
+            fields = parse_parts(parts)
+            @info "Deserialized fields from client" names=collect(keys(fields))
 
-        (; context, public_key, ciphertext) = receive_from_client(sock)
-        println("Received $(length(ciphertext)) ciphertext(s) from client")
-        
-        result = ciphertext + ciphertext
+            context = fields["context"]
+            public_key = fields["public_key"]
+            ciphertext = fields["ciphertext"]
 
-        serialize(sock, result)
-        flush(sock)
-        println("Sent $(length(result)) result ciphertext(s)")
-    finally
-        close(sock)
-        close(server)
+            result = ciphertext + ciphertext
+            @info "Computed result"
+
+            form = HTTP.Form(["result" => make_part(result)])
+            body = read(form)
+            @info "Serialized result" length=length(body)
+            return HTTP.Response(200, ["Content-Type" => HTTP.content_type(form)]; body)
+        catch e
+            @error "Error in /compute handler" exception=(e, catch_backtrace())
+            rethrow()
+        end
     end
+
+    server = HTTP.serve!(router, "0.0.0.0", port)
+    @info "RemoteFHE server listening on port $port"
+    wait(server)
 end
 
-function run_client(values::AbstractVector{<:Real}, host::AbstractString = "127.0.0.1", port::Integer = 25015)
+function run_client(values::AbstractVector{<:Real}, host::AbstractString = "http://127.0.0.1:8080")
     (; context, public_key, private_key) = setup_context()
     ciphertext = encrypt_vector(values, public_key, context)
     println("Encrypted values: ", values)
 
-    sock = connect(host, port)
-    try
-        send_to_server(sock, context, public_key, ciphertext)
+    form = HTTP.Form([
+        "context" => make_part(context),
+        "public_key" => make_part(public_key),
+        "ciphertext" => make_part(ciphertext),
+    ])
+    response = HTTP.post("$host/compute", ["Content-Type" => HTTP.content_type(form)], form)
 
-        result_encrypted = deserialize(sock)
+    ct = HTTP.header(response, "Content-Type")
+    resp_parts = HTTP.parse_multipart_form(ct, response.body)
+    resp_fields = parse_parts(resp_parts)
+    result_encrypted = resp_fields["result"]
 
-        result_plain = decrypt(result_encrypted, private_key)
-        println("Decrypted result: ", result_plain)
-        return result_plain
-    finally
-        close(sock)
-    end
+    result_plain = decrypt(result_encrypted, private_key)
+    println("Decrypted result: ", result_plain)
+    return result_plain
 end
 
 end # module RemoteFHE

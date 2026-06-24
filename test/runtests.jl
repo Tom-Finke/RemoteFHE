@@ -1,22 +1,29 @@
 using Test
+using HTTP
 using OpenFHE
 using SecureArithmetic
 using RemoteFHE
 
 @testset verbose=true showtiming=true "RemoteFHE" begin
 
-@testset "Ciphertext serialization round-trip" begin
+@testset "Multipart serialization round-trip" begin
     values = [1.0, 2.0, 3.0, 4.0]
     cli = RemoteFHE.setup_context()
     ciphertext = RemoteFHE.encrypt_vector(values, cli.public_key, cli.context)
 
-    sock = IOBuffer()
-    RemoteFHE.send_to_server(sock, cli.context, cli.public_key, ciphertext)
-    seekstart(sock) # Other than TCP sockets, reading and writing side are the same. We need to go back to the start of the buffer for reading
-    srv = RemoteFHE.receive_from_client(sock)
+    form = HTTP.Form([
+        "context" => RemoteFHE.make_part(cli.context),
+        "public_key" => RemoteFHE.make_part(cli.public_key),
+        "ciphertext" => RemoteFHE.make_part(ciphertext),
+    ])
 
-    @test srv.ciphertext isa SecureArray
-    decrypted = decrypt(srv.ciphertext, cli.private_key)
+    content_type = HTTP.content_type(form)
+    @test startswith(content_type, "multipart/form-data")
+    parts = HTTP.parse_multipart_form(content_type, read(form))
+    fields = RemoteFHE.parse_parts(parts)
+
+    @test fields["ciphertext"] isa SecureArray
+    decrypted = decrypt(fields["ciphertext"], cli.private_key)
     @test collect(decrypted) ≈ values
 end
 
@@ -27,13 +34,20 @@ end
     cli = RemoteFHE.setup_context()
     ciphertext = RemoteFHE.encrypt_vector(values, cli.public_key, cli.context)
 
-    sock = IOBuffer()
-    RemoteFHE.send_to_server(sock, cli.context, cli.public_key, ciphertext)
-    seekstart(sock) # Other than TCP sockets, reading and writing side are the same. We need to go back to the start of the buffer for reading
-    srv = RemoteFHE.receive_from_client(sock)
-    ciphertext_2 = RemoteFHE.encrypt_vector(values_2, srv.public_key, srv.context)
+    form = HTTP.Form([
+        "context" => RemoteFHE.make_part(cli.context),
+        "public_key" => RemoteFHE.make_part(cli.public_key),
+        "ciphertext" => RemoteFHE.make_part(ciphertext),
+        "string" => "A raw string",
+    ])
+    body = read(form)
+    content_type = HTTP.content_type(form)
+    parts = HTTP.parse_multipart_form(content_type, body)
+    fields = RemoteFHE.parse_parts(parts)
 
-    result = srv.ciphertext + ciphertext_2
+    ciphertext_2 = RemoteFHE.encrypt_vector(values_2, fields["public_key"], fields["context"])
+
+    result = fields["ciphertext"] + ciphertext_2
 
     decrypted = decrypt(result, cli.private_key)
     @test collect(decrypted) ≈ [2, 3, 5, 6]
